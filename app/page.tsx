@@ -8,6 +8,7 @@ import remarkGfm from "remark-gfm";
 type Message = {
   role: "user" | "assistant" | "system";
   content: string;
+  image?: string;
 };
 
 type ChatSession = {
@@ -17,8 +18,16 @@ type ChatSession = {
   createdAt: number;
 };
 
+type UsageStats = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  estimatedCost: number;
+};
+
 export default function Home() {
   const API_KEY = process.env.NEXT_PUBLIC_GROQ_API_KEY || "";
+  
 
   const initialChat: ChatSession = {
     id: "default-chat",
@@ -30,6 +39,24 @@ export default function Home() {
   const [chats, setChats] = useState<ChatSession[]>([initialChat]);
   const [activeChatId, setActiveChatId] = useState<string>("default-chat");
   const [isHydrated, setIsHydrated] = useState(false);
+  const [chatSearch, setChatSearch] = useState("");
+
+  const filteredChats = useMemo(() => {
+    const keyword = chatSearch.trim().toLowerCase();
+
+    if (!keyword) return chats;
+
+    return chats.filter((chat) => {
+      const titleMatch = chat.title.toLowerCase().includes(keyword);
+
+      const messageMatch = chat.messages.some((msg) =>
+        msg.content.toLowerCase().includes(keyword)
+      );
+
+      return titleMatch || messageMatch;
+    });
+  }, [chats, chatSearch]);
+
   useEffect(() => {
     const savedChats = localStorage.getItem("my-chatgpt-chats");
     const savedActiveChatId = localStorage.getItem("my-chatgpt-active");
@@ -56,7 +83,19 @@ export default function Home() {
 
   useEffect(() => {
     if (!isHydrated) return;
-    localStorage.setItem("my-chatgpt-chats", JSON.stringify(chats));
+
+    const chatsWithoutImages = chats.map((chat) => ({
+      ...chat,
+      messages: chat.messages.map((msg) => ({
+        ...msg,
+        image: undefined,
+      })),
+    }));
+
+    localStorage.setItem(
+      "my-chatgpt-chats",
+      JSON.stringify(chatsWithoutImages)
+    );
   }, [chats, isHydrated]);
 
   useEffect(() => {
@@ -86,6 +125,19 @@ export default function Home() {
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
+  const [conversationSummary, setConversationSummary] = useState("");
+
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+
+  const [lastToolUsed, setLastToolUsed] = useState("");
+
+  const [usageStats, setUsageStats] = useState<UsageStats>({
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    estimatedCost: 0,
+  });
+
   const activeChat = useMemo(
     () => chats.find((chat) => chat.id === activeChatId),
     [chats, activeChatId]
@@ -94,6 +146,18 @@ export default function Home() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activeChat?.messages, loading]);
+
+  useEffect(() => {
+    const savedSummary = localStorage.getItem("my-chatgpt-summary");
+
+    if (savedSummary) {
+      setConversationSummary(savedSummary);
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("my-chatgpt-summary", conversationSummary);
+  }, [conversationSummary]);
 
   const createNewChat = () => {
     const newChat: ChatSession = {
@@ -172,22 +236,167 @@ export default function Home() {
     );
   };
 
-  const sendMessage = async () => {
-    if (!input.trim() || !activeChat) return;
+  const routeModel = (input: string, hasImage: boolean): string => {
+    const text = input.toLowerCase();
 
-    const chatId = activeChat.id;
-    const userMessage = input.trim();
-    setInput("");
+    // 🖼️ 有圖片關鍵字（之後 multimodal 用）
+    if (hasImage) {
+      return "meta-llama/llama-4-scout-17b-16e-instruct";
+    }
 
-    const currentMessages = activeChat.messages;
-    const updatedMessages: Message[] = [
-      ...currentMessages,
-      { role: "user", content: userMessage },
-    ];
+    // 🧠 複雜問題（推理 / 計算 / 解釋）
+    if (
+      text.includes("explain") ||
+      text.includes("為什麼") ||
+      text.includes("推導") ||
+      text.length > 100
+    ) {
+      return "llama-3.3-70b-versatile";
+    }
 
-    updateChatMessages(chatId, updatedMessages);
-    autoTitleIfNeeded(chatId, userMessage);
-    setLoading(true);
+    // ⚡ 預設走快模型
+    return "llama-3.1-8b-instant";
+  };
+
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      setSelectedImage(reader.result as string);
+      e.target.value = "";
+    };
+
+    reader.readAsDataURL(file);
+  };
+
+  const removeSelectedImage = () => {
+    setSelectedImage(null);
+  };
+
+  const runToolIfNeeded = (userMessage: string) => {
+    const text = userMessage.toLowerCase();
+
+    // Calculator tool
+    if (
+      text.includes("calculate") ||
+      text.includes("計算") ||
+      text.includes("算一下")
+    ) {
+      const expression = userMessage
+        .replace("calculate", "")
+        .replace("計算", "")
+        .replace("算一下", "")
+        .trim();
+
+      try {
+        // demo 用，正式產品不要直接 eval
+        const result = Function(`"use strict"; return (${expression})`)();
+
+        return {
+          toolName: "Calculator",
+          result: `Calculator result: ${expression} = ${result}`,
+        };
+      } catch {
+        return {
+          toolName: "Calculator",
+          result: "Calculator failed: 無法計算這個表達式。",
+        };
+      }
+    }
+
+    // Time tool
+    if (
+      text.includes("current time") ||
+      text.includes("現在幾點") ||
+      text.includes("現在時間")
+    ) {
+      const now = new Date().toLocaleString("zh-TW", {
+        timeZone: "Asia/Taipei",
+      });
+
+      return {
+        toolName: "Current Time",
+        result: `Current time in Taipei: ${now}`,
+      };
+    }
+
+    return null;
+  };
+
+  const exportCurrentChat = () => {
+    if (!activeChat) return;
+
+    const text = activeChat.messages
+      .map((m) => {
+        const role = m.role === "user" ? "User" : "Assistant";
+        const imageNote = m.image ? "\n[Image attached]" : "";
+        return `${role}:\n${m.content}${imageNote}`;
+      })
+      .join("\n\n--------------------\n\n");
+
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${activeChat.title || "chat-history"}.txt`;
+    a.click();
+
+    URL.revokeObjectURL(url);
+  };
+
+  const estimateTokens = (text: string) => {
+    // 粗略估算：英文約 4 chars/token；中文通常更接近 1~2 chars/token
+    // 作業展示用，非精準計費
+    return Math.ceil(text.length / 2);
+  };
+
+const getModelRate = (modelName: string) => {
+  // 單位：USD / 1M tokens，展示用估算
+  // 你可以依照 Groq 官方 pricing 手動調整
+  const rates: Record<string, { input: number; output: number }> = {
+    "llama-3.1-8b-instant": { input: 0.05, output: 0.08 },
+    "llama-3.3-70b-versatile": { input: 0.59, output: 0.79 },
+    "meta-llama/llama-4-scout-17b-16e-instruct": {
+      input: 0.11,
+      output: 0.34,
+    },
+  };
+
+  return rates[modelName] || { input: 0, output: 0 };
+};
+
+const updateUsageStats = (
+  modelName: string,
+  inputText: string,
+  outputText: string
+) => {
+  const inputTokens = estimateTokens(inputText);
+  const outputTokens = estimateTokens(outputText);
+  const totalTokens = inputTokens + outputTokens;
+  const rate = getModelRate(modelName);
+
+  const estimatedCost =
+    (inputTokens / 1_000_000) * rate.input +
+    (outputTokens / 1_000_000) * rate.output;
+
+  setUsageStats((prev) => ({
+    inputTokens: prev.inputTokens + inputTokens,
+    outputTokens: prev.outputTokens + outputTokens,
+    totalTokens: prev.totalTokens + totalTokens,
+    estimatedCost: prev.estimatedCost + estimatedCost,
+  }));
+};
+
+  const summarizeOldMessages = async (messagesToSummarize: Message[]) => {
+    if (messagesToSummarize.length === 0) return;
+
+    const oldText = messagesToSummarize
+      .map((m) => `${m.role}: ${m.content}`)
+      .join("\n\n");
 
     try {
       const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -197,13 +406,141 @@ export default function Home() {
           Authorization: `Bearer ${API_KEY}`,
         },
         body: JSON.stringify({
-          model,
+          model: "llama-3.1-8b-instant",
           messages: [
-            { role: "system", content: systemPrompt },
-            ...updatedMessages.map((m) => ({
-              role: m.role,
-              content: m.content,
-            })),
+            {
+              role: "system",
+              content:
+                "請將以下舊對話整理成精簡但完整的長期記憶摘要。保留重要背景、使用者需求、已完成功能、尚未完成事項。請使用繁體中文。",
+            },
+            {
+              role: "user",
+              content: `
+  Existing summary:
+  ${conversationSummary || "No previous summary."}
+
+  Old conversation:
+  ${oldText}
+  `,
+            },
+          ],
+          temperature: 0.3,
+          max_tokens: 700,
+        }),
+      });
+
+      const data = await res.json();
+      const summary = data?.choices?.[0]?.message?.content;
+
+      if (summary) {
+        setConversationSummary(summary);
+      }
+    } catch (error) {
+      console.error("Failed to summarize old messages:", error);
+    }
+  };
+
+  const [currentModel, setCurrentModel] = useState("");
+
+  const sendMessage = async () => {
+    if ((!input.trim() && !selectedImage) || !activeChat) return;
+
+    const chatId = activeChat.id;
+    const userMessage = input.trim();
+    const imageToSend = selectedImage;
+
+    setInput("");
+    setSelectedImage(null);
+
+    const currentMessages = activeChat.messages;
+    const updatedMessages: Message[] = [
+      ...currentMessages,
+      {
+        role: "user",
+        content: userMessage || "請分析這張圖片。",
+        image: imageToSend || undefined,
+      },
+    ];
+
+    const SUMMARY_THRESHOLD = 18;
+    const RECENT_MESSAGE_COUNT = 10;
+
+    const oldMessages =
+      updatedMessages.length > SUMMARY_THRESHOLD
+        ? updatedMessages.slice(0, updatedMessages.length - RECENT_MESSAGE_COUNT)
+        : [];
+
+    const recentMessages =
+      updatedMessages.length > SUMMARY_THRESHOLD
+        ? updatedMessages.slice(-RECENT_MESSAGE_COUNT)
+        : updatedMessages;
+
+    updateChatMessages(chatId, updatedMessages);
+    autoTitleIfNeeded(chatId, userMessage);
+    setLoading(true);
+    
+    try {
+      const selectedModel = routeModel(userMessage, !!imageToSend);
+      setCurrentModel(selectedModel);
+
+      const toolResult = runToolIfNeeded(userMessage);
+      setLastToolUsed(toolResult ? toolResult.toolName : "");
+
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${API_KEY}`,
+        },
+
+        body: JSON.stringify({
+          model: selectedModel,
+          messages: [
+            {
+              role: "system",
+              content: `
+            ${systemPrompt}
+
+            Conversation long-term memory:
+            ${conversationSummary || "No conversation summary yet."}
+
+            Tool result:
+            ${toolResult ? `[${toolResult.toolName}] ${toolResult.result}` : "No tool used."}
+            `,
+            },
+            ...recentMessages.map((m, index) => {
+              const isLatestMessage = index === recentMessages.length - 1;
+
+              if (m.image && isLatestMessage) {
+                return {
+                  role: m.role,
+                  content: [
+                    {
+                      type: "text",
+                      text: m.content || "請分析這張圖片。",
+                    },
+                    {
+                      type: "image_url",
+                      image_url: {
+                        url: m.image,
+                      },
+                    },
+                  ],
+                };
+              }
+
+              if (m.image) {
+                return {
+                  role: m.role,
+                  content: `${m.content}\n\n[這則訊息曾包含一張圖片]`,
+                };
+              }
+
+              return {
+                role: m.role,
+                content: m.content,
+              };
+            }),
           ],
           temperature,
           max_tokens: maxTokens,
@@ -272,6 +609,16 @@ export default function Home() {
           ...updatedMessages,
           { role: "assistant", content: "AI 沒回應" },
         ]);
+      } else {
+        updateUsageStats(
+          selectedModel,
+          recentMessages.map((m) => m.content).join("\n"),
+          assistantText
+        );
+
+        if (oldMessages.length > 0) {
+          summarizeOldMessages(oldMessages);
+        }
       }
     } catch (error) {
       console.error(error);
@@ -312,13 +659,24 @@ export default function Home() {
                 + New Chat
               </button>
 
+              <button className="secondary-btn" onClick={exportCurrentChat}>
+                ⬇ Export Chat
+              </button>
+
               <button className="danger-btn" onClick={deleteCurrentChat}>
                 🗑 Delete Chat
               </button>
             </div>
 
+            <input
+              className="chat-search-input"
+              value={chatSearch}
+              onChange={(e) => setChatSearch(e.target.value)}
+              placeholder="Search chats..."
+            />
+
             <div className="chat-list">
-              {chats.map((chat) => (
+              {filteredChats.map((chat) => (
                 <div
                   key={chat.id}
                   className={`chat-list-item ${
@@ -359,7 +717,30 @@ export default function Home() {
 
       <section className="center-panel">
         <div className="center-header">
-          <h1>{activeChat?.title || "My ChatGPT"}</h1>
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            <h1 style={{ margin: 0 }}>
+              {activeChat?.title || "My ChatGPT"}
+            </h1>
+
+            <p
+              style={{
+                fontSize: "12px",
+                color: "#94a3b8",
+                margin: 0,
+              }}
+            >
+              Model: {currentModel || "尚未使用"}
+            </p>
+            <p
+              style={{
+                fontSize: "12px",
+                color: "#38bdf8",
+                margin: 0,
+              }}
+            >
+              Tool: {lastToolUsed || "None"}
+            </p>
+          </div>
         </div>
 
         <div className="messages-area">
@@ -378,9 +759,17 @@ export default function Home() {
               }`}
             >
               <div className={`message-bubble ${msg.role}`}>
+                {msg.image && (
+                  <img
+                    src={msg.image}
+                    alt="uploaded"
+                    className="message-image"
+                  />
+                )}
+                
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
                   {msg.content}
-                </ReactMarkdown>
+                </ReactMarkdown> 
               </div>
             </div>
           ))}
@@ -394,17 +783,40 @@ export default function Home() {
           <div ref={bottomRef} />
         </div>
 
-        <div className="input-area">
-          <input
-            className="chat-input"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-            placeholder="輸入訊息..."
-          />
-          <button className="send-btn" onClick={sendMessage}>
-            Send
-          </button>
+        <div className="input-area-wrapper">
+          {selectedImage && (
+            <div className="image-preview">
+              <img src={selectedImage} alt="preview" />
+              <button onClick={removeSelectedImage}>×</button>
+            </div>
+          )}
+
+          <div className="input-area">
+            <label className="upload-btn">
+              📎
+              <input
+                type="file"
+                accept="image/*"
+                onClick={(e) => {
+                  e.currentTarget.value = "";
+                }}
+                onChange={handleImageUpload}
+                hidden
+              />
+            </label>
+
+            <input
+              className="chat-input"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+              placeholder="輸入訊息，或上傳圖片..."
+            />
+
+            <button className="send-btn" onClick={sendMessage}>
+              Send
+            </button>
+          </div>
         </div>
       </section>
 
@@ -435,6 +847,28 @@ export default function Home() {
             </div>
 
             <div className="settings-group">
+              <label>Conversation Memory Summary</label>
+
+              <div className="summary-box">
+                {conversationSummary || "No summary yet. It will be generated automatically when the conversation becomes long."}
+              </div>
+
+              {conversationSummary && (
+                <button
+                  className="danger-btn"
+                  onClick={() => {
+                    if (confirm("確定要清除 conversation memory summary 嗎？")) {
+                      setConversationSummary("");
+                      localStorage.removeItem("my-chatgpt-summary");
+                    }
+                  }}
+                >
+                  Clear Summary
+                </button>
+              )}
+            </div>
+
+            <div className="settings-group">
               <label>Temperature: {temperature}</label>
               <input
                 type="range"
@@ -453,6 +887,16 @@ export default function Home() {
                 value={maxTokens}
                 onChange={(e) => setMaxTokens(Number(e.target.value))}
               />
+            </div>
+
+            <div className="settings-group">
+              <label>Token / Cost Estimate</label>
+              <div className="usage-box">
+                <div>Input tokens: {usageStats.inputTokens}</div>
+                <div>Output tokens: {usageStats.outputTokens}</div>
+                <div>Total tokens: {usageStats.totalTokens}</div>
+                <div>Estimated cost: ${usageStats.estimatedCost.toFixed(6)}</div>
+              </div>
             </div>
           </>
         )}
